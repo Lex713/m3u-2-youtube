@@ -1,0 +1,225 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>M3U → YouTube Music Playlist (client-side)</title>
+  <style>
+    body{font-family:system-ui,Segoe UI,Roboto,Arial;margin:18px;max-width:900px}
+    textarea{width:100%;height:160px}
+    .row{display:flex;gap:10px;align-items:center}
+    .chip{padding:6px 10px;background:#eee;border-radius:8px}
+    table{width:100%;border-collapse:collapse;margin-top:8px}
+    td,th{border:1px solid #ddd;padding:6px}
+    button{padding:8px 12px;border-radius:8px}
+    .log{white-space:pre-wrap;background:#f9f9f9;padding:8px;border-radius:6px;max-height:260px;overflow:auto}
+  </style>
+</head>
+<body>
+  <h1>M3U → YouTube Playlist (client-side)</h1>
+  <p>Upload an <code>.m3u</code> file, trim local path segments, authorize your Google account (YouTube Data API), then create a playlist in your account with best-match videos.</p>
+
+  <div class="row">
+    <label class="chip">Trim leading path segments:</label>
+    <input id="trimSegments" type="number" min="0" value="2" style="width:80px" />
+    <label class="chip">(e.g. 2 will remove first two path folders from file paths)</label>
+  </div>
+
+  <div style="margin-top:10px">
+    <input id="fileInput" type="file" accept=".m3u,.txt" />
+    <button id="parseBtn">Parse M3U</button>
+  </div>
+
+  <h3>Tracks (first 200 shown)</h3>
+  <div id="tracksArea"></div>
+
+  <div style="margin-top:12px">
+    <button id="authorizeBtn">Authorize with Google (YouTube)</button>
+    <button id="createPlaylistBtn" disabled>Create playlist from parsed tracks</button>
+  </div>
+
+  <h3>Report</h3>
+  <div id="log" class="log"></div>
+
+  <script>
+  // --------- Configuration ---------
+
+  const CLIENT_ID = 'MY_DUMMY_GOOGLE_OAUTH_CLIENT_ID.apps.googleusercontent.com';
+  const SCOPES = 'https://www.googleapis.com/auth/youtube'; // full YouTube access (create playlists)
+
+  // ------------------- Application state -------------------
+  let accessToken = null;
+  let parsedTracks = []; // [{orig, query}]
+
+  const fileInput = document.getElementById('fileInput');
+  const parseBtn = document.getElementById('parseBtn');
+  const trimSegmentsEl = document.getElementById('trimSegments');
+  const tracksArea = document.getElementById('tracksArea');
+  const authorizeBtn = document.getElementById('authorizeBtn');
+  const createPlaylistBtn = document.getElementById('createPlaylistBtn');
+  const logEl = document.getElementById('log');
+
+  function log(...args){
+    console.log(...args);
+    logEl.textContent += args.map(a=>typeof a==='object'?JSON.stringify(a):String(a)).join(' ') + '\n';
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+
+  parseBtn.addEventListener('click', async ()=>{
+    const f = fileInput.files[0];
+    if(!f){ alert('Choose an m3u file first'); return; }
+    const txt = await f.text();
+    parsedTracks = parseM3U(txt, Number(trimSegmentsEl.value||0));
+    renderTracks();
+    createPlaylistBtn.disabled = parsedTracks.length===0 || !accessToken;
+    log('Parsed', parsedTracks.length, 'tracks');
+  });
+
+  authorizeBtn.addEventListener('click', async ()=>{
+    if(CLIENT_ID.startsWith('REPLACE')){
+      alert('You must supply a Google OAuth Client ID in the source before using this demo. See instructions below.');
+      return;
+    }
+    try{
+      await requestAccessToken();
+      log('Authorized — access token acquired');
+      createPlaylistBtn.disabled = parsedTracks.length===0;
+    }catch(e){
+      log('Auth error', e && e.message ? e.message : e);
+    }
+  });
+
+  createPlaylistBtn.addEventListener('click', async ()=>{
+    if(!accessToken){ alert('Please authorize first'); return; }
+    if(parsedTracks.length===0){ alert('No tracks parsed'); return; }
+    createPlaylistBtn.disabled = true;
+    try{
+      const title = prompt('New playlist title', 'Imported from M3U');
+      const playlistId = await createPlaylist(title || 'Imported from M3U');
+      log('Created playlist', playlistId);
+      // add items sequentially with a small delay to avoid simple rate limits
+      const report = {added:0,notFound:[]};
+      for(let i=0;i<parsedTracks.length;i++){
+        const t = parsedTracks[i];
+        const vid = await findBestMatchVideoId(t.query);
+        if(vid){
+          await addVideoToPlaylist(playlistId, vid);
+          report.added++;
+          log('Added', t.query, '->', vid);
+        }else{
+          report.notFound.push(t.query);
+          log('Not found:', t.query);
+        }
+        // modest delay
+        await new Promise(r=>setTimeout(r, 600));
+      }
+      log('Done. Added:', report.added, 'Not found count:', report.notFound.length);
+      if(report.notFound.length) log('Not found list:\n' + report.notFound.join('\n'));
+    }catch(e){ log('Error during playlist creation', e); }
+    createPlaylistBtn.disabled = false;
+  });
+
+  // ------------------- M3U parsing & trimming -------------------
+  function parseM3U(text, trimSegments){
+    const lines = text.split(/\r?\n/).map(l=>l.trim()).filter(Boolean);
+    const tracks = [];
+    for(const line of lines){
+      if(line.startsWith('#')) continue; // ignore comments, #EXTINF lines could contain metadata but keep simple
+      // Often m3u has absolute or relative paths like C:\Music\Artist\Album\01 - Title.mp3
+      // Trim the first N path segments from the left (by splitting on / or \\)
+      let query = line;
+      if(trimSegments>0){
+        const parts = line.split(/\\\\|\//).filter(Boolean);
+        if(parts.length>trimSegments){
+          query = parts.slice(trimSegments).join(' ');
+        }else{
+          query = parts.join(' ');
+        }
+      }
+      // clean common separators and extension
+      query = query.replace(/\.[a-z0-9]{2,5}$/i,'').replace(/[_\-\(\)\[\]]+/g,' ').replace(/\s+/g,' ').trim();
+      if(query) tracks.push({orig:line, query});
+    }
+    // dedupe keeping order
+    const seen = new Set();
+    const unique = [];
+    for(const t of tracks){ if(!seen.has(t.query)){ seen.add(t.query); unique.push(t); } }
+    return unique.slice(0, 2000); // safety cap
+  }
+
+  function renderTracks(){
+    const max = Math.min(parsedTracks.length, 200);
+    let html = '<table><tr><th>#</th><th>Original</th><th>Query</th></tr>';
+    for(let i=0;i<max;i++){
+      const t = parsedTracks[i];
+      html += `<tr><td>${i+1}</td><td>${escapeHtml(t.orig)}</td><td>${escapeHtml(t.query)}</td></tr>`;
+    }
+    html += '</table>';
+    tracksArea.innerHTML = html + (parsedTracks.length>max?`<div>...and ${parsedTracks.length-max} more</div>`:'');
+  }
+
+  function escapeHtml(s){ return s.replace(/[&<>"']/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c])); }
+
+  // ------------------- Google OAuth (Identity Services) -------------------
+  // This implementation uses the Google Identity Services token client to obtain an access token.
+  // See: https://developers.google.com/identity
+  let tokenClient = null;
+  function requestAccessToken(){
+    return new Promise((resolve,reject)=>{
+      if(accessToken) return resolve(accessToken);
+      // dynamically load library
+      if(!window.google || !window.google.accounts || !window.google.accounts.oauth2){
+        const s = document.createElement('script');
+        s.src = 'https://accounts.google.com/gsi/client';
+        s.onload = () => initTokenClient(resolve,reject);
+        s.onerror = reject;
+        document.head.appendChild(s);
+      }else initTokenClient(resolve,reject);
+    });
+  }
+  function initTokenClient(resolve,reject){
+    try{
+      tokenClient = google.accounts.oauth2.initTokenClient({
+        client_id: CLIENT_ID,
+        scope: SCOPES,
+        callback: (resp) => {
+          if(resp.error) return reject(resp);
+          accessToken = resp.access_token;
+          resolve(accessToken);
+        }
+      });
+      tokenClient.requestAccessToken();
+    }catch(e){ reject(e); }
+  }
+
+  // ------------------- YouTube API helpers -------------------
+  async function findBestMatchVideoId(query){
+    // Basic search against YouTube Data API v3 search.list
+    const url = 'https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&maxResults=1&q=' + encodeURIComponent(query);
+    const res = await fetch(url, {headers:{ Authorization: 'Bearer ' + accessToken }});
+    if(!res.ok){ log('YT search failed', await res.text()); return null; }
+    const data = await res.json();
+    if(data.items && data.items.length) return data.items[0].id.videoId;
+    return null;
+  }
+
+  async function createPlaylist(title){
+    const url = 'https://www.googleapis.com/youtube/v3/playlists?part=snippet%2Cstatus';
+    const body = {snippet:{title:title,description:'Imported from M3U'}, status:{privacyStatus:'private'}};
+    const res = await fetch(url, {method:'POST',headers:{'Authorization':'Bearer '+accessToken,'Content-Type':'application/json'},body:JSON.stringify(body)});
+    if(!res.ok) throw new Error('createPlaylist failed: ' + await res.text());
+    const data = await res.json();
+    return data.id;
+  }
+
+  async function addVideoToPlaylist(playlistId, videoId){
+    const url = 'https://www.googleapis.com/youtube/v3/playlistItems?part=snippet';
+    const body = {snippet:{playlistId:playlistId,resourceId:{kind:'youtube#video',videoId:videoId}}};
+    const res = await fetch(url, {method:'POST',headers:{'Authorization':'Bearer '+accessToken,'Content-Type':'application/json'},body:JSON.stringify(body)});
+    if(!res.ok){ const txt = await res.text(); log('addVideo failed', txt); throw new Error(txt); }
+    return (await res.json());
+  }
+
+  // ------------------- end -------------------
+  </script>
+</html>
