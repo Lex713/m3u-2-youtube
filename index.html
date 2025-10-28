@@ -45,7 +45,7 @@
   // --------- Configuration ---------
 
   const CLIENT_ID = '261339182669-qo9lrvdpu16ii3bncmplu9iafqkb8e5p.apps.googleusercontent.com';
-  const SCOPES = 'https://www.googleapis.com/auth/youtube'; // full YouTube access (create playlists)
+  const SCOPES = 'https://www.googleapis.com/auth/youtube.force-ssl'; // full *force* YouTube access (create playlists)
 
   // ------------------- Application state -------------------
   let accessToken = null;
@@ -115,9 +115,16 @@
       }
       log('Done. Added:', report.added, 'Not found count:', report.notFound.length);
       if(report.notFound.length) log('Not found list:\n' + report.notFound.join('\n'));
-    }catch(e){ log('Error during playlist creation', e); }
-    createPlaylistBtn.disabled = false;
-  });
+    } catch(e) {
+      // expanded error reporting
+      if (e && e.message) {
+        log('Error during playlist creation:', e.message);
+      } else if (typeof e === 'object') {
+        log('Error during playlist creation (object):', JSON.stringify(e, null, 2));
+      } else {
+        log('Error during playlist creation (unknown):', String(e));
+      }
+    };
 
   // ------------------- M3U parsing & trimming -------------------
   function parseM3U(text, trimSegments){
@@ -205,12 +212,35 @@
 
   async function createPlaylist(title){
     const url = 'https://www.googleapis.com/youtube/v3/playlists?part=snippet%2Cstatus';
-    const body = {snippet:{title:title,description:'Imported from M3U'}, status:{privacyStatus:'private'}};
-    const res = await fetch(url, {method:'POST',headers:{'Authorization':'Bearer '+accessToken,'Content-Type':'application/json'},body:JSON.stringify(body)});
-    if(!res.ok) throw new Error('createPlaylist failed: ' + await res.text());
-    const data = await res.json();
+    const body = {
+      snippet: { title, description: 'Imported from M3U' },
+      status: { privacyStatus: 'private' }
+    };
+    log('Creating playlist with title:', title);
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Authorization': 'Bearer ' + accessToken,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(body)
+    });
+  
+    const txt = await res.text();
+    if (!res.ok) {
+      // parse potential error JSON to show message
+      let err = txt;
+      try {
+        const parsed = JSON.parse(txt);
+        err = parsed.error?.message || txt;
+      } catch(_) {}
+      throw new Error('createPlaylist failed: ' + err);
+    }
+  
+    const data = JSON.parse(txt);
     return data.id;
   }
+
 
   async function addVideoToPlaylist(playlistId, videoId){
     const url = 'https://www.googleapis.com/youtube/v3/playlistItems?part=snippet';
